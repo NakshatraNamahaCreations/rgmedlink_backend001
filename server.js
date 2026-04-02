@@ -43,6 +43,7 @@ app.use(
       "http://localhost:5173",
       "http://localhost:8081",
       "https://rgmedlinkadminpanel.netlify.app",
+      "https://rgmedlinkadmipanel.netlify.app",
       /\.rgmedlink\.com$/,
     ],
     credentials: true,
