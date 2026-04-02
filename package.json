@@ -1,0 +1,31 @@
+{
+  "name": "rjmedlinkbackend",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.81.0",
+    "@google-cloud/vision": "^5.3.5",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "express-mongo-sanitize": "^2.2.0",
+    "express-rate-limit": "^8.3.2",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.3",
+    "mongodb": "^7.1.0",
+    "mongoose": "^9.2.3",
+    "multer": "^2.1.1",
+    "pdf-parse": "^1.1.1",
+    "pdfkit": "^0.18.0",
+    "react-icons": "^5.5.0",
+    "tesseract.js": "^7.0.0"
+  }
+}
