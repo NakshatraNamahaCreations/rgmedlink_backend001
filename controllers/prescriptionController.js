@@ -118,16 +118,13 @@ exports.getPrescriptionStats = async (req, res) => {
 ============================================================ */
 exports.createPrescription = async (req, res) => {
   try {
-    const { patient, doctor, start, discount = 0, meds } = req.body;
+    const {  doctor, start, discount = 0, meds } = req.body;
 
-    if (!patient || !doctor || !start)
-      return res.status(400).json({ success: false, message: "patient, doctor and start date are required" });
+    if ( !doctor || !start)
+      return res.status(400).json({ success: false, message: " doctor and start date are required" });
     if (!meds || meds.length === 0)
       return res.status(400).json({ success: false, message: "No medicines provided" });
 
-    const patientDoc = await Patient.findById(patient).lean();
-    if (!patientDoc)
-      return res.status(404).json({ success: false, message: "Patient not found" });
 
     let built;
     try {
@@ -139,14 +136,7 @@ exports.createPrescription = async (req, res) => {
     const { processedMeds, subtotal, gst, total, maxDuration } = built;
 
     // ── Bulk stock deduction ──
-    await Medicine.bulkWrite(
-      processedMeds.map((m) => ({
-        updateOne: {
-          filter: { _id: m.medicine },
-          update: { $inc: { stock: -m.qty, demand30: m.qty, demand90: m.qty } },
-        },
-      }))
-    );
+
 
     const start_d = new Date(start);
     const expiryDate = new Date(start_d);
@@ -154,7 +144,6 @@ exports.createPrescription = async (req, res) => {
 
     const rx = await Prescription.create({
       rxId: `RX-${Date.now()}`,
-      patient,
       doctor,
       start: start_d,
       expiry: expiryDate,
@@ -168,7 +157,6 @@ exports.createPrescription = async (req, res) => {
     });
 
     const populated = await Prescription.findById(rx._id)
-      .populate("patient", "name patientId phone gender")
       .populate("meds.medicine", "name unit price");
 
     res.status(201).json({ success: true, data: populated });
@@ -185,12 +173,12 @@ exports.createPrescription = async (req, res) => {
 exports.getPrescriptions = async (req, res) => {
   try {
     const { page, limit, skip, all } = paginate(req.query);
-    const { payStatus, orderStatus, patientId, search, from, to } = req.query;
+    const { payStatus, orderStatus, search, from, to } = req.query;
     const filter = {};
 
     if (payStatus) filter.payStatus = payStatus;
     if (orderStatus) filter.orderStatus = orderStatus;
-    if (patientId) filter.patient = patientId;
+    
 
     if (from || to) {
       filter.createdAt = {};
@@ -198,26 +186,10 @@ exports.getPrescriptions = async (req, res) => {
       if (to) filter.createdAt.$lte = new Date(new Date(to).setHours(23, 59, 59, 999));
     }
 
-    // Server-side search across patient name, rxId, doctor
-    if (search) {
-      const matchingPatients = await Patient.find({
-        $or: [
-          { name: { $regex: search, $options: "i" } },
-          { patientId: { $regex: search, $options: "i" } },
-        ],
-      }).select("_id").lean();
 
-      const patientIds = matchingPatients.map((p) => p._id);
-
-      filter.$or = [
-        { rxId: { $regex: search, $options: "i" } },
-        { doctor: { $regex: search, $options: "i" } },
-        ...(patientIds.length ? [{ patient: { $in: patientIds } }] : []),
-      ];
-    }
 
     let q = Prescription.find(filter)
-      .populate("patient", "name patientId phone gender city")
+
       .populate("meds.medicine", "name unit price category")
       .sort({ createdAt: -1 });
 
@@ -248,7 +220,7 @@ exports.getPrescriptions = async (req, res) => {
 exports.getPrescriptionById = async (req, res) => {
   try {
     const rx = await Prescription.findById(req.params.id)
-      .populate("patient", "name patientId phone gender age city state")
+
       .populate("meds.medicine", "name unit price category gstPct stock");
 
     if (!rx) return res.status(404).json({ success: false, message: "Prescription not found" });
@@ -277,7 +249,6 @@ exports.updatePrescription = async (req, res) => {
       return res.status(400).json({ success: false, message: "No valid fields to update" });
 
     const rx = await Prescription.findByIdAndUpdate(req.params.id, updates, { new: true })
-      .populate("patient", "name patientId phone")
       .populate("meds.medicine", "name unit price");
 
     if (!rx) return res.status(404).json({ success: false, message: "Prescription not found" });
@@ -300,8 +271,7 @@ exports.updatePrescriptionStatus = async (req, res) => {
     if (!valid.includes(orderStatus))
       return res.status(400).json({ success: false, message: `Invalid status. Must be one of: ${valid.join(", ")}` });
 
-    const rx = await Prescription.findByIdAndUpdate(req.params.id, { orderStatus }, { new: true })
-      .populate("patient", "name patientId");
+    const rx = await Prescription.findByIdAndUpdate(req.params.id, { orderStatus }, { new: true });
 
     if (!rx) return res.status(404).json({ success: false, message: "Prescription not found" });
 
@@ -357,47 +327,115 @@ exports.cleanUnusedPrescriptions = async (req, res) => {
 ============================================================ */
 exports.processPayment = async (req, res) => {
   try {
-    const rx = await Prescription.findById(req.params.id).populate("patient");
-    if (!rx) return res.status(404).json({ success: false, message: "Prescription not found" });
+    const rx = await Prescription.findById(req.params.id)
+      .populate("meds.medicine"); // 🔥 IMPORTANT (for name, price)
 
-    if (rx.payStatus === "Paid")
-      return res.status(400).json({ success: false, message: "Prescription already paid" });
+    if (!rx) {
+      return res.status(404).json({
+        success: false,
+        message: "Prescription not found",
+      });
+    }
 
+    if (rx.payStatus === "Paid") {
+      return res.status(400).json({
+        success: false,
+        message: "Prescription already paid",
+      });
+    }
+
+    const { patientId } = req.body;
+
+    const patientDoc = await Patient.findById(patientId);
+
+    // ✅ FIX 1: Patient validation
+    if (!patientDoc) {
+      return res.status(404).json({
+        success: false,
+        message: "Patient not found",
+      });
+    }
+
+    // ✅ Check if order already exists
+    const existingOrder = await Order.findOne({ prescription: rx._id }).lean();
+    if (existingOrder) {
+      return res.json({
+        success: true,
+        message: "Order already exists",
+        data: { prescription: rx, order: existingOrder },
+      });
+    }
+
+    // 🔥 FIX 2: STOCK DEDUCTION AFTER PAYMENT
+    await Medicine.bulkWrite(
+      rx.meds.map((m) => ({
+        updateOne: {
+          filter: { _id: m.medicine._id },
+          update: {
+            $inc: {
+              stock: -m.qty,
+              demand30: m.qty,
+              demand90: m.qty,
+            },
+          },
+        },
+      }))
+    );
+
+    // 🔥 FIX 3: UPDATE PRESCRIPTION STATUS
     rx.payStatus = "Paid";
     rx.orderStatus = "Processing";
     await rx.save();
 
-    const existingOrder = await Order.findOne({ prescription: rx._id }).lean();
-    if (existingOrder)
-      return res.json({ success: true, message: "Order already exists", data: { prescription: rx, order: existingOrder } });
-
-    const patientDoc = rx.patient;
-
+    // 🔥 FIX 4: INCLUDE ITEMS IN ORDER
     const order = await Order.create({
       userId: patientDoc._id.toString(),
       prescription: rx._id,
       totalAmount: rx.total,
       paymentStatus: "Paid",
       orderStatus: "Processing",
+
+      items: rx.meds.map((m) => ({
+        medicineId: m.medicine._id,
+        name: m.medicine.name,
+        qty: m.qty,
+        price: m.price,
+        unit: m.medicine.unit || "tablet",
+      })),
+
       patientDetails: {
         name: patientDoc.name,
         phone: patientDoc.phone,
         gender: patientDoc.gender || "",
         orderingFor: "admin",
       },
+
       addressDetails: {
         fullAddress: patientDoc.address || "",
         city: patientDoc.city || "",
         state: patientDoc.state || "",
         pincode: patientDoc.pincode || "",
       },
+
       deliveryAddress: patientDoc.address || "",
     });
 
-    res.json({ success: true, message: "Payment processed & order created", data: { prescription: rx, order } });
+    return res.json({
+      success: true,
+      message: "Payment processed & order created",
+      data: {
+        prescription: rx,
+        order,
+      },
+    });
+
   } catch (err) {
     console.error("Process Payment Error:", err);
-    res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({
+      success: false,
+      message: "Payment processing failed",
+      error: err.message,
+    });
   }
 };
 
@@ -446,7 +484,6 @@ exports.renewPrescription = async (req, res) => {
 
     const newRx = await Prescription.create({
       rxId: `RX-${Date.now()}`,
-      patient: oldRx.patient,
       doctor: oldRx.doctor,
       start: newStart,
       expiry: newExpiry,
@@ -467,7 +504,7 @@ exports.renewPrescription = async (req, res) => {
     });
 
     const populated = await Prescription.findById(newRx._id)
-      .populate("patient", "name patientId phone")
+    
       .populate("meds.medicine", "name unit price");
 
     res.status(201).json({ success: true, message: "Prescription renewed", data: populated });

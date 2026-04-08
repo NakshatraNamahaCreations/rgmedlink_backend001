@@ -20,11 +20,7 @@ const medSchema = new mongoose.Schema({
 const prescriptionSchema = new mongoose.Schema(
   {
     rxId: { type: String, unique: true },
-    patient: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Patient",
-      required: true,
-    },
+
     doctor: String,
     start: Date,
     expiry: Date,
@@ -48,7 +44,7 @@ const prescriptionSchema = new mongoose.Schema(
 );
 
 /* ── INDEXES for fast queries at scale ── */
-prescriptionSchema.index({ patient: 1, createdAt: -1 });
+
 prescriptionSchema.index({ payStatus: 1, orderStatus: 1 });
 prescriptionSchema.index({ createdAt: -1 });
 

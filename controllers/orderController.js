@@ -5,6 +5,111 @@ const Patient = require("../models/Patient");
 const Medicine = require("../models/Medicine");
 const Prescription = require("../models/Prescription");
 
+
+const Razorpay = require("razorpay");
+const crypto = require("crypto");
+
+// const razorpay = new Razorpay({
+//   key_id: process.env.RAZORPAY_KEY_ID,
+//   key_secret: process.env.RAZORPAY_KEY_SECRET,
+// });
+
+
+exports.createRazorpayOrder = async (req, res) => {
+  try {
+    const { orderId } = req.body;
+
+    const order = await Order.findById(orderId);
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    // ✅ Prevent duplicate payment
+    if (order.paymentStatus === "Paid") {
+      return res.json({
+        success: true,
+        message: "Already paid",
+      });
+    }
+
+    const razorpayOrder = await razorpay.orders.create({
+      amount: Math.round(order.totalAmount * 100), // ₹ → paise
+      currency: "INR",
+      receipt: order.orderId,
+    });
+
+    res.json({
+      success: true,
+      razorpayOrder,
+      amount: order.totalAmount,
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: "Razorpay order failed",
+      error: err.message,
+    });
+  }
+};
+
+exports.verifyRazorpayPayment = async (req, res) => {
+  try {
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+      orderId,
+    } = req.body;
+
+    const body = razorpay_order_id + "|" + razorpay_payment_id;
+
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(body)
+      .digest("hex");
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid signature",
+      });
+    }
+
+    const order = await Order.findById(orderId);
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    // ✅ UPDATE YOUR EXISTING FIELDS
+    order.paymentStatus = "Paid";
+    order.paymentDate = new Date();
+
+    await order.save();
+
+    res.json({
+      success: true,
+      message: "Payment successful",
+      order,
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: "Payment verification failed",
+      error: err.message,
+    });
+  }
+};
+
 /* ── pagination helper ───────────────────────────────────────── */
 function paginate(query) {
   const page = Math.max(1, parseInt(query.page) || 1);
@@ -15,70 +120,164 @@ function paginate(query) {
   return { page, limit, skip, all };
 }
 
+
+
 exports.createOrder = async (req, res) => {
   try {
-    const { patientId, addressId, prescriptionId, totalAmount, imageUri, pharmacistReview } = req.body;
+    const { patientId, addressId, prescriptionId, items } = req.body;
 
+    // ✅ VALIDATE PATIENT ID FIRST
     if (!patientId) {
-      return res.status(400).json({ success: false, message: "Patient is required" });
+      return res.status(400).json({
+        success: false,
+        message: "Patient is required",
+      });
     }
 
     const patient = await PatientDetails.findById(patientId);
-    if (!patient) return res.status(404).json({ success: false, message: "Patient not found" });
+
+    if (!patient) {
+      return res.status(404).json({
+        success: false,
+        message: "Patient not found",
+      });
+    }
+
+    // ✅ VALIDATE ITEMS (VERY IMPORTANT)
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No medicines provided",
+      });
+    }
+
+    // ✅ VALIDATE medicineId
+    for (const m of items) {
+      if (!m.medicineId) {
+        return res.status(400).json({
+          success: false,
+          message: "medicineId missing in items",
+        });
+      }
+    }
 
     const userId = patient.userId;
 
+    // 🔥 FETCH MEDICINES
+    const medicineIds = items.map(i => i.medicineId);
+
+    const medicines = await Medicine.find({
+      _id: { $in: medicineIds }
+    });
+
+    const medMap = {};
+    medicines.forEach(m => {
+      medMap[m._id.toString()] = m;
+    });
+
+    // ✅ VALIDATE STOCK + EXISTENCE
+    for (const item of items) {
+      const med = medMap[item.medicineId.toString()];
+
+      if (!med) {
+        return res.status(404).json({
+          success: false,
+          message: "Medicine not found",
+        });
+      }
+
+      if (med.stock < item.qty) {
+        return res.status(400).json({
+          success: false,
+          message: `${med.name} only has ${med.stock} in stock`,
+        });
+      }
+    }
+
+    // 🔥 CALCULATE TOTAL
+    const subtotal = items.reduce((sum, item) => {
+      const med = medMap[item.medicineId.toString()];
+      const price = med.sellingPrice || med.price || 0;
+      return sum + item.qty * price;
+    }, 0);
+
+    const gst = items.reduce((sum, item) => {
+      const med = medMap[item.medicineId.toString()];
+      const price = med.sellingPrice || med.price || 0;
+      const pct = med.gstPct || 12;
+      return sum + (item.qty * price * pct) / 100;
+    }, 0);
+
+    const serverTotal = Math.round((subtotal + gst) * 100) / 100;
+
+    // ✅ GET ADDRESS
     let address = addressId
       ? await Address.findById(addressId)
       : await Address.findOne({ userId, isDefault: true });
 
-    if (!address) return res.status(400).json({ success: false, message: "Address not found" });
-
-    // Check if prescriptionId is a valid ObjectId
-    const mongoose = require("mongoose");
-    const validRxId = prescriptionId && mongoose.Types.ObjectId.isValid(prescriptionId);
-
-    // Server-side price calculation if prescription exists
-    let serverTotal = totalAmount || 0;
-    if (validRxId) {
-      try {
-        const rx = await Prescription.findById(prescriptionId).populate("meds.medicine");
-        if (rx && rx.meds?.length > 0) {
-          const subtotal = rx.meds.reduce((s, m) => s + (m.subtotal || 0), 0);
-          const gst = subtotal * 0.12;
-          serverTotal = Math.round((subtotal + gst) * 100) / 100;
-        }
-      } catch {}
+    if (!address) {
+      return res.status(400).json({
+        success: false,
+        message: "Address not found",
+      });
     }
 
+    // ✅ CREATE ORDER
     const order = await Order.create({
       userId,
-      prescription: validRxId ? prescriptionId : undefined,
+      prescription: prescriptionId,
       patient: patient._id,
       totalAmount: serverTotal,
-      pharmacistReview: !validRxId,
-      patientDetails: {
-        name: patient.name,
-        phone: patient.primaryPhone,
-        secondaryPhone: patient.secondaryPhone || "",
-        gender: patient.gender,
-        orderingFor: patient.orderingFor || "myself",
-      },
+
+      items: items.map((item) => {
+        const med = medMap[item.medicineId.toString()];
+        const price = med.sellingPrice || med.price || 0;
+
+        return {
+          medicineId: item.medicineId,
+          name: med.name,
+          qty: item.qty,
+          price,
+          unit: med.unit || "tablet",
+          duration: item.duration || 0,
+          freq: item.freq || { m: 0, a: 0, n: 0 },
+          subtotal: item.qty * price,
+        };
+      }),
+
+     patientDetails: {
+  patientId: patient.patientId, // 🔥 ADD THIS
+  name: patient.name,
+  phone: patient.primaryPhone,
+  secondaryPhone: patient.secondaryPhone || "",
+  gender: patient.gender,
+  orderingFor: patient.orderingFor || "myself",
+},
+
       addressDetails: {
         fullAddress: address.fullAddress,
         city: address.city,
         state: address.state,
         pincode: address.pincode,
       },
+
       deliveryAddress: address.fullAddress,
     });
 
-    res.status(201).json({ success: true, message: "Order placed successfully", order });
+    return res.status(201).json({
+      success: true,
+      message: "Order created successfully",
+      order,
+    });
+
   } catch (error) {
-    res.status(500).json({ success: false, message: "Order creation failed", error: error.message });
+    return res.status(500).json({
+      success: false,
+      message: "Order creation failed",
+      error: error.message,
+    });
   }
 };
-
 
 // ============================
 // BILLING TABLE  (server-side paginated)
@@ -107,9 +306,9 @@ exports.getBillingTable = async (req, res) => {
     }
 
     let q = Order.find(filter)
-      .select("orderId invoiceNumber invoiceStatus invoiceDate paymentStatus totalAmount patientDetails createdAt")
-      .sort({ createdAt: -1 })
-      .lean();
+  .select("orderId invoiceNumber invoiceStatus invoiceDate paymentStatus totalAmount patientDetails createdAt items")
+  .sort({ createdAt: -1 })
+  .lean();
 
     if (!all) q = q.skip(skip).limit(limit);
 
@@ -249,19 +448,46 @@ exports.deleteOrder = async (req, res) => {
 
 exports.markPaymentPaid = async (req, res) => {
   try {
-    const order = await Order.findByIdAndUpdate(
-      req.params.id,
-      { paymentStatus: "Paid", paymentDate: new Date() },
-      { new: true }
-    );
-    if (!order) return res.status(404).json({ success: false, message: "Order not found" });
+    const order = await Order.findById(req.params.id);
 
-    res.json({ success: true, message: "Payment marked as Paid", data: order });
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    // ✅ Already paid check
+    if (order.paymentStatus === "Paid") {
+      return res.json({
+        success: true,
+        message: "Already paid",
+        data: order,
+      });
+    }
+
+  
+
+    // ✅ Update payment
+    order.paymentStatus = "Paid";
+    order.paymentDate = new Date();
+
+    await order.save();
+
+    res.json({
+      success: true,
+      message: "Payment marked as Paid",
+      data: order,
+    });
+
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({
+      success: false,
+      message: "Payment update failed",
+      error: err.message,
+    });
   }
 };
-
 
 // ============================
 // ADMIN: CREATE ORDER DIRECTLY
@@ -270,13 +496,20 @@ exports.createAdminOrder = async (req, res) => {
   try {
     const { patientId, doctor, items, address, discount = 0, notes } = req.body;
 
+      const patient = await PatientDetails.findById(patientId);
+
+    if (!patient) {
+      return res.status(404).json({
+        success: false,
+        message: "Patient not found",
+      });
+    }
+
     if (!patientId) return res.status(400).json({ success: false, message: "patientId is required" });
     if (!items || !Array.isArray(items) || items.length === 0)
       return res.status(400).json({ success: false, message: "items array is required" });
     if (!address || !address.fullAddress)
       return res.status(400).json({ success: false, message: "address.fullAddress is required" });
-
-    const patient = await Patient.findById(patientId).lean();
     if (!patient) return res.status(404).json({ success: false, message: "Patient not found" });
 
     // ── Fetch ALL medicines in one query (not N+1) ──
@@ -290,22 +523,42 @@ exports.createAdminOrder = async (req, res) => {
     const medMap = {};
     medicines.forEach((m) => { medMap[m._id.toString()] = m; });
 
-    // Stock check
-    for (const item of items) {
-      const med = medMap[item.medicineId];
-      if (!med) return res.status(404).json({ success: false, message: `Medicine ${item.medicineId} not found` });
-      if (med.stock < item.qty) {
-        return res.status(400).json({
-          success: false,
-          message: `Insufficient stock for ${med.name}. Available: ${med.stock}, Requested: ${item.qty}`,
-        });
-      }
-    }
+  
+// 🔥 ADD THIS HERE 👇 (REPLACE OLD LOOP)
+
+// Merge quantities of same medicine
+const mergedItems = {};
+
+items.forEach(item => {
+  const id = item.medicineId.toString();
+  if (!mergedItems[id]) mergedItems[id] = 0;
+  mergedItems[id] += item.qty;
+});
+
+// Validate stock
+for (const id in mergedItems) {
+  const med = medMap[id];
+
+  if (!med) {
+    return res.status(404).json({
+      success: false,
+      message: "Medicine not found",
+    });
+  }
+
+  if (med.stock < mergedItems[id]) {
+    return res.status(400).json({
+      success: false,
+      message: `${med.name} only has ${med.stock} in stock`,
+    });
+  }
+}
+  
 
     // Build prescription meds & totals
     let subtotal = 0;
     const pressMeds = items.map((item) => {
-      const med = medMap[item.medicineId];
+      const med = medMap[item.medicineId.toString()];
       const freq = item.freq || { m: 1, a: 0, n: 1 };
       const duration = item.duration || 5;
       const qty = item.qty ?? (freq.m + freq.a + freq.n) * duration;
@@ -341,22 +594,25 @@ exports.createAdminOrder = async (req, res) => {
     });
 
     // ── Bulk stock deduction (not N+1 loop) ──
-    await Medicine.bulkWrite(
-      items.map((item) => ({
-        updateOne: {
-          filter: { _id: item.medicineId },
-          update: { $inc: { stock: -item.qty, demand30: item.qty, demand90: item.qty } },
-        },
-      }))
-    );
+  await Medicine.bulkWrite(
+  Object.entries(mergedItems).map(([id, qty]) => ({
+    updateOne: {
+      filter: { _id: id },
+      update: { $inc: { stock: -qty, demand30: qty, demand90: qty } },
+    },
+  }))
+);
 
     const order = await Order.create({
-      userId: patient._id.toString(),
+      userId: patient.userId,
       prescription: prescription._id,
+      patient: patient._id,
+
       totalAmount: total,
       patientDetails: {
         name: patient.name,
-        phone: patient.phone,
+        patientId: patient.patientId, // ✅ ADD THIS
+        phone: patient.primaryPhone,
         gender: patient.gender || "",
         orderingFor: "admin",
       },

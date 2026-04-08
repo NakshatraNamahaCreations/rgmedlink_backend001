@@ -1,11 +1,18 @@
 const PatientDetails = require("../models/PatientDetails");
+const Address = require("../models/Address");
 
-// ============================
-// CREATE PATIENT
-// ============================
 exports.createPatientDetails = async (req, res) => {
   try {
-    const { userId, name, primaryPhone } = req.body;
+    const {
+      userId,
+      name,
+      primaryPhone,
+      secondaryPhone,
+      fullAddress,
+      city,
+      state,
+      pincode
+    } = req.body;
 
     // ✅ Required validation
     if (!userId || !name || !primaryPhone) {
@@ -17,6 +24,7 @@ exports.createPatientDetails = async (req, res) => {
 
     // ✅ Phone validation
     const phoneRegex = /^[0-9]{10}$/;
+
     if (!phoneRegex.test(primaryPhone)) {
       return res.status(400).json({
         success: false,
@@ -24,8 +32,34 @@ exports.createPatientDetails = async (req, res) => {
       });
     }
 
-    // ✅ First patient auto-default
-    const existing = await PatientDetails.findOne({ userId });
+    if (secondaryPhone && !phoneRegex.test(secondaryPhone)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid secondary phone number"
+      });
+    }
+
+    // ✅ Prevent duplicate patient
+    const existingPatient = await PatientDetails.findOne({
+      primaryPhone,
+      userId,
+      isDeleted: false
+    });
+
+    if (existingPatient) {
+      return res.status(200).json({
+        success: true,
+        message: "Patient already exists",
+        data: existingPatient
+      });
+    }
+
+    // ✅ First patient auto default
+    const existing = await PatientDetails.findOne({
+      userId,
+      isDeleted: false
+    });
+
     if (!existing) {
       req.body.isDefault = true;
     }
@@ -38,7 +72,33 @@ exports.createPatientDetails = async (req, res) => {
       );
     }
 
-    const data = await PatientDetails.create(req.body);
+    // =========================================
+    // 🔥 CREATE ADDRESS (IF PROVIDED)
+    // =========================================
+
+    let addressDoc = null;
+
+    if (fullAddress) {
+      addressDoc = await Address.create({
+        userId,
+        fullAddress,
+        city,
+        state,
+        pincode,
+        isDefault: true
+      });
+    }
+
+    // =========================================
+    // 🔥 CREATE PATIENT WITH ADDRESS LINK
+    // =========================================
+
+    const patientData = {
+      ...req.body,
+      addressId: addressDoc ? addressDoc._id : undefined
+    };
+
+    const data = await PatientDetails.create(patientData);
 
     res.status(201).json({
       success: true,
@@ -47,6 +107,8 @@ exports.createPatientDetails = async (req, res) => {
     });
 
   } catch (err) {
+    console.error("CREATE PATIENT ERROR:", err);
+
     res.status(500).json({
       success: false,
       message: "Failed to create patient",
@@ -69,7 +131,7 @@ exports.getPatientDetails = async (req, res) => {
       });
     }
 
-    const data = await PatientDetails.find({ userId })
+    const data = await PatientDetails.find({ userId, isDeleted: false })
       .sort({ isDefault: -1, createdAt: -1 });
 
     res.json({
@@ -95,7 +157,8 @@ exports.getDefaultPatient = async (req, res) => {
 
     const patient = await PatientDetails.findOne({
       userId,
-      isDefault: true
+      isDefault: true,
+      isDeleted: false
     });
 
     if (!patient) {
@@ -124,7 +187,10 @@ exports.getDefaultPatient = async (req, res) => {
 // ============================
 exports.getPatientDetailsById = async (req, res) => {
   try {
-    const data = await PatientDetails.findById(req.params.id);
+    const data = await PatientDetails.findOne({
+      _id: req.params.id,
+      isDeleted: false
+    });
 
     if (!data) {
       return res.status(404).json({
@@ -204,21 +270,54 @@ exports.updatePatientDetails = async (req, res) => {
 // ============================
 // GET ALL (ADMIN)
 // ============================
+const Order = require("../models/Order");
+
 exports.getAllPatientDetails = async (req, res) => {
   try {
-    const data = await PatientDetails.find()
-      .sort({ createdAt: -1 });
+
+const data = await PatientDetails.aggregate([
+  {
+    $match: {
+      isDeleted: false
+    }
+  },
+  {
+    $lookup: {
+      from: "orders",
+      localField: "_id",
+      foreignField: "patient",
+      as: "orders",
+    },
+  },
+  {
+  $lookup: {
+    from: "addresses",
+    localField: "addressId",
+    foreignField: "_id",
+    as: "address"
+  }
+},
+{
+  $unwind: {
+    path: "$address",
+    preserveNullAndEmptyArrays: true
+  }
+},
+  {
+    $sort: { createdAt: -1 },
+  },
+]);
 
     res.json({
       success: true,
-      data
+      data,
     });
 
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Failed to fetch all patients",
-      error: error.message
+      message: "Failed to fetch patients",
+      error: error.message,
     });
   }
 };
@@ -226,34 +325,68 @@ exports.getAllPatientDetails = async (req, res) => {
 // ============================
 // DELETE PATIENT
 // ============================
+
 exports.deletePatientDetails = async (req, res) => {
   try {
-    const patient = await PatientDetails.findById(req.params.id);
+    const patientId = req.params.id;
 
-    if (!patient) {
+    // ✅ 1. ADMIN CHECK FIRST (IMPORTANT)
+    const userRole = req.headers.userrole;
+
+    if (userRole !== "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Only admin can delete patients"
+      });
+    }
+
+    // ✅ 2. FIND PATIENT
+    const patient = await PatientDetails.findById(patientId);
+
+    if (!patient || patient.isDeleted) {
       return res.status(404).json({
         success: false,
         message: "Patient not found"
       });
     }
 
-    // ❌ Prevent deleting default
-    if (patient.isDefault) {
+    // ✅ 3. CHECK IF ANY ORDERS EXIST
+    const orderExists = await Order.exists({ patient: patient._id });
+
+    if (orderExists) {
       return res.status(400).json({
         success: false,
-        message: "Default patient cannot be deleted"
+        message: "Cannot delete patient with orders"
       });
     }
 
-    await PatientDetails.findByIdAndDelete(req.params.id);
+    // ✅ 4. HANDLE DEFAULT PATIENT SWITCH
+    if (patient.isDefault) {
+      const next = await PatientDetails.findOne({
+        userId: patient.userId,
+        _id: { $ne: patient._id },
+        isDeleted: false
+      }).sort({ createdAt: -1 });
 
-    res.json({
+      if (next) {
+        next.isDefault = true;
+        await next.save();
+      }
+    }
+
+    // ✅ 5. SOFT DELETE
+    patient.isDeleted = true;
+    await patient.save();
+
+    return res.status(200).json({
       success: true,
       message: "Patient deleted successfully"
     });
 
   } catch (err) {
-    res.status(500).json({
+    console.error("DELETE PATIENT ERROR:", err);
+
+    return res.status(500).json({
       success: false,
       message: "Delete failed",
       error: err.message

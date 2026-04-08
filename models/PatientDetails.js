@@ -8,6 +8,11 @@ const patientDetailsSchema = new mongoose.Schema(
     index: true
   },
 
+  patientId: {
+    type: String,
+    unique: true,
+  },
+
   name: {
     type: String,
     required: true,
@@ -30,7 +35,12 @@ const patientDetailsSchema = new mongoose.Schema(
 
   secondaryPhone: {
     type: String,
-    default: ""
+    validate: {
+      validator: function(v) {
+        return !v || /^[0-9]{10}$/.test(v);
+      },
+      message: "Invalid secondary phone number"
+    }
   },
 
   gender: {
@@ -43,15 +53,41 @@ const patientDetailsSchema = new mongoose.Schema(
     enum: ["myself", "someone"],
     default: "myself"
   },
+  addressId: {
+  type: mongoose.Schema.Types.ObjectId,
+  ref: "Address"
+},
 
-  // ⭐ NEW
   isDefault: {
     type: Boolean,
     default: false
-  }
-
+  },
+  
+isDeleted: {
+  type: Boolean,
+  default: false
+}
 },
 { timestamps: true }
 );
+
+// ✅ AUTO GENERATE PATIENT ID (CORRECT PLACE)
+patientDetailsSchema.pre("save", async function () {
+  if (!this.patientId) {
+
+    const lastPatient = await this.constructor
+      .findOne({ patientId: { $exists: true } }) // important fix
+      .sort({ createdAt: -1 });
+
+    let nextNumber = 1;
+
+    if (lastPatient && lastPatient.patientId) {
+      const num = parseInt(lastPatient.patientId.replace("P", ""));
+      nextNumber = num + 1;
+    }
+
+    this.patientId = "P" + String(nextNumber).padStart(3, "0");
+  }
+});
 
 module.exports = mongoose.model("PatientDetails", patientDetailsSchema);

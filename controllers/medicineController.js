@@ -84,19 +84,24 @@ exports.getMedicines = async (req, res) => {
 exports.getMedicineById = async (req, res) => {
   try {
     const medicine = await Medicine.findById(req.params.id);
+
+    if (!medicine) {
+      return res.status(404).json({ message: "Medicine not found" });
+    }
+
     res.json(medicine);
+
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 };
-
 
 /* ===============================
    UPDATE MEDICINE
 ================================ */
 exports.updateMedicine = async (req, res) => {
   try {
-    const medicine = await Medicine.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    const medicine = await Medicine.findByIdAndUpdate(req.params.id, req.body, { new: true,  runValidators: true });
     res.json(medicine);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -109,8 +114,14 @@ exports.updateMedicine = async (req, res) => {
 ================================ */
 exports.deleteMedicine = async (req, res) => {
   try {
-    await Medicine.findByIdAndDelete(req.params.id);
+    const medicine = await Medicine.findByIdAndDelete(req.params.id);
+
+    if (!medicine) {
+      return res.status(404).json({ message: "Medicine not found" });
+    }
+
     res.json({ message: "Medicine deleted successfully" });
+
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -123,29 +134,56 @@ exports.deleteMedicine = async (req, res) => {
 exports.adjustStock = async (req, res) => {
   try {
     const { type, quantity } = req.body;
+
+    // 🔍 Validate medicine
     const medicine = await Medicine.findById(req.params.id);
-
-    if (!medicine)
+    if (!medicine) {
       return res.status(404).json({ message: "Medicine not found" });
+    }
 
+    // 🔍 Validate type
+    if (!["add", "reduce"].includes(type)) {
+      return res.status(400).json({ message: "Invalid type. Use 'add' or 'reduce'" });
+    }
+
+    // 🔍 Validate quantity
     const qty = Number(quantity);
+    if (!qty || qty <= 0) {
+      return res.status(400).json({ message: "Invalid quantity" });
+    }
 
+    // ➕ Add stock
     if (type === "add") {
       medicine.stock += qty;
     }
 
+    // ➖ Reduce stock
     if (type === "reduce") {
-      if (medicine.stock < qty)
+      if (medicine.stock < qty) {
         return res.status(400).json({ message: "Insufficient stock" });
+      }
 
       medicine.stock -= qty;
-      medicine.demand30 += qty;
-      medicine.demand90 += qty;
+
+      // 📊 Update demand tracking
+      medicine.demand30 = (medicine.demand30 || 0) + qty;
+      medicine.demand90 = (medicine.demand90 || 0) + qty;
     }
 
+    // 💾 Save changes
     await medicine.save();
-    res.json({ message: "Stock updated successfully", medicine });
+
+    return res.json({
+      success: true,
+      message: "Stock updated successfully",
+      medicine,
+    });
+
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({
+      success: false,
+      message: "Stock update failed",
+      error: error.message,
+    });
   }
 };

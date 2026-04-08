@@ -6,6 +6,60 @@ const extractTextFromPDF = require("../utils/pdfReader");
 const generateStyledPDF = require("../utils/generateStyledPDF");
 const { extractTextFromImage, parsePrescriptionText } = require("../utils/imageOCR");
 
+
+
+exports.savePrescription = async (req, res) => {
+  try {
+    const {
+      rxId,
+      doctor,
+      medicines,
+      subtotal,
+      gst,
+      total
+    } = req.body;
+
+
+  if (!medicines || medicines.length === 0) {
+  return res.status(400).json({
+    success: false,
+    message: "No medicines found in prescription"
+  });
+}
+
+
+    const savedPrescription = await Prescription.create({
+      rxId,
+      doctor,
+      date: new Date(),
+      
+      meds: medicines
+      .filter(m => m.medicineId) // 🔥 IMPORTANT     
+      .map(m => ({
+        medicine: m.medicineId,
+        qty: m.qty,
+        freq: m.freq,
+        duration: m.duration,
+        price: m.price,
+        subtotal: m.subtotal
+      })),
+      subtotal,
+      gst,
+      total,
+      payStatus: "Unpaid"
+    });
+
+    res.json({
+      success: true,
+      prescriptionId: savedPrescription._id
+    });
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+
 // ============================
 // IMAGE PRESCRIPTION UPLOAD (camera/gallery)
 // ============================
@@ -70,7 +124,7 @@ exports.processImagePrescription = async (req, res) => {
     if (extractedText) {
       // Extract all durations mentioned in the text for context
       const allDurations = [];
-      const durRegex = /(\d+)\s*(?:days?|d\b)/gi;
+     const durRegex = /\b(\d{1,3})\s*(?:days?|d\b)\b/gi;
       let dm;
       while ((dm = durRegex.exec(extractedText)) !== null) {
         allDurations.push(parseInt(dm[1], 10));
@@ -94,9 +148,27 @@ exports.processImagePrescription = async (req, res) => {
           // Try to find a duration near this medicine in the text
           const medIdx = extractedText.indexOf(baseName);
           const nearbyText = extractedText.substring(Math.max(0, medIdx - 50), medIdx + baseName.length + 80);
-          const nearDur = nearbyText.match(/(\d+)\s*(?:days?|d\b)/i);
-          const duration = nearDur ? parseInt(nearDur[1], 10) : (allDurations.length > 0 ? allDurations[0] : 5);
+      
+      
+   const nearDur = nearbyText.match(/(\d{1,3})\s*(?:days?)/i);
 
+let duration = 5;
+
+if (nearDur) {
+  duration = parseInt(nearDur[1], 10);
+
+  // 🔥 FIX: handle merged values like 130
+  const freqMatch = nearbyText.match(/(\d)[-–—.,](\d)[-–—.,](\d)/);
+
+  if (freqMatch && duration > 90) {
+    const freqDigits = freqMatch[1] + freqMatch[2] + freqMatch[3]; // "101"
+
+    if (duration.toString().startsWith(freqDigits)) {
+      // remove frequency part from duration
+      duration = parseInt(duration.toString().slice(freqDigits.length), 10);
+    }
+  }
+}
           // Try to find frequency near this medicine
           let freq = { ...freqInText };
           let freqLabel = freqInText.label;
@@ -138,6 +210,7 @@ exports.processImagePrescription = async (req, res) => {
     const gst = subtotal * 0.12;
     const total = subtotal + gst;
 
+    
     // Clean up uploaded file
     try { fs.unlinkSync(filePath); } catch {}
 

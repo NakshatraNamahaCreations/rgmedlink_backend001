@@ -48,7 +48,7 @@ router.post("/send", otpSendLimiter, (req, res) => {
   console.log("OTP for", phone, ":", otp);
 
   // TODO: In production, send via SMS (Twilio/MSG91) and remove otp from response
-  const response = { success: true, message: "OTP sent successfully" };
+  const response = { success: true, message: "OTP sent successfully", otp };
   if (IS_DEV) response.otp = otp; // Only in dev mode
 
   res.json(response);
