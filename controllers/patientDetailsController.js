@@ -40,19 +40,18 @@ exports.createPatientDetails = async (req, res) => {
     }
 
     // ✅ Prevent duplicate patient
-    const existingPatient = await PatientDetails.findOne({
-      primaryPhone,
-      userId,
-      isDeleted: false
-    });
+//     const existingPatient = await PatientDetails.findOne({
+//       primaryPhone,
+//       userId,
+//       isDeleted: false
+//     });
 
-    if (existingPatient) {
-      return res.status(200).json({
-        success: true,
-        message: "Patient already exists",
-        data: existingPatient
-      });
-    }
+// if (existingPatient) {
+//   return res.status(400).json({
+//     success: false,
+//     message: "Patient already exists with this phone"
+//   });
+// }
 
     // ✅ First patient auto default
     const existing = await PatientDetails.findOne({
@@ -76,18 +75,19 @@ exports.createPatientDetails = async (req, res) => {
     // 🔥 CREATE ADDRESS (IF PROVIDED)
     // =========================================
 
-    let addressDoc = null;
+   let addressDoc = null;
 
-    if (fullAddress) {
-      addressDoc = await Address.create({
-        userId,
-        fullAddress,
-        city,
-        state,
-        pincode,
-        isDefault: true
-      });
-    }
+// ✅ SAFE HYBRID FIX (IMPORTANT)
+// if (!req.body.addressId && fullAddress) {
+//   addressDoc = await Address.create({
+//     userId,
+//     fullAddress,
+//     city,
+//     state,
+//     pincode,
+//     isDefault: true
+//   });
+// }
 
     // =========================================
     // 🔥 CREATE PATIENT WITH ADDRESS LINK
