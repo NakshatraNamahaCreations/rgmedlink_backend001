@@ -53,6 +53,11 @@ const patientDetailsSchema = new mongoose.Schema(
     enum: ["myself", "someone"],
     default: "myself"
   },
+
+  isActive: {
+  type: Boolean,
+  default: true
+},
   addressId: {
   type: mongoose.Schema.Types.ObjectId,
   ref: "Address"

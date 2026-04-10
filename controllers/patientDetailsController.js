@@ -322,25 +322,89 @@ const data = await PatientDetails.aggregate([
   }
 };
 
+
+
+// ============================
+// GET PATIENT STATS (ADD THIS)
+// ============================
+exports.getPatientStats = async (req, res) => {
+  try {
+
+    const patients = await PatientDetails.aggregate([
+      { $match: { isDeleted: false } },
+
+      {
+        $lookup: {
+          from: "orders",
+          localField: "_id",
+          foreignField: "patient",
+          as: "orders"
+        }
+      }
+    ]);
+
+    let total = patients.length;
+    let male = 0;
+    let female = 0;
+    let withPrescriptions = 0;
+    let newThisMonth = 0;
+
+    const startOfMonth = new Date(
+      new Date().getFullYear(),
+      new Date().getMonth(),
+      1
+    );
+
+    patients.forEach(p => {
+      // ✅ Gender count
+      if (p.gender === "Male") male++;
+      else if (p.gender === "Female") female++;
+
+      // ✅ New this month
+      if (new Date(p.createdAt) >= startOfMonth) {
+        newThisMonth++;
+      }
+
+      // ✅ With prescription (CORRECT FIX)
+      const hasOrder = p.orders && p.orders.length > 0;
+
+if (hasOrder) withPrescriptions++;
+
+    });
+
+    res.json({
+      success: true,
+      data: {
+        total,
+        newThisMonth,
+        growthPct: 0,
+        withPrescriptions,
+        gender: {
+          male,
+          female,
+          other: total - (male + female)
+        }
+      }
+    });
+
+  } catch (err) {
+    console.error("STATS ERROR:", err);
+    res.status(500).json({
+      success: false,
+      message: err.message
+    });
+  }
+};
+
+
 // ============================
 // DELETE PATIENT
 // ============================
-
 exports.deletePatientDetails = async (req, res) => {
   try {
     const patientId = req.params.id;
 
-    // ✅ 1. ADMIN CHECK FIRST (IMPORTANT)
-    const userRole = req.headers.userrole;
-
-    if (userRole !== "admin") {
-      return res.status(403).json({
-        success: false,
-        message: "Only admin can delete patients"
-      });
-    }
-
-    // ✅ 2. FIND PATIENT
+    // ✅ 1. FIND PATIENT FIRST
     const patient = await PatientDetails.findById(patientId);
 
     if (!patient || patient.isDeleted) {
@@ -350,7 +414,15 @@ exports.deletePatientDetails = async (req, res) => {
       });
     }
 
-    // ✅ 3. CHECK IF ANY ORDERS EXIST
+    // ✅ 2. CHECK USER OWNERSHIP
+    if (patient.userId !== req.user?.phone) {
+      return res.status(403).json({
+        success: false,
+        message: "Not authorized"
+      });
+    }
+
+    // ✅ 3. CHECK ORDERS
     const orderExists = await Order.exists({ patient: patient._id });
 
     if (orderExists) {
@@ -360,7 +432,7 @@ exports.deletePatientDetails = async (req, res) => {
       });
     }
 
-    // ✅ 4. HANDLE DEFAULT PATIENT SWITCH
+    // ✅ 4. HANDLE DEFAULT SWITCH
     if (patient.isDefault) {
       const next = await PatientDetails.findOne({
         userId: patient.userId,
@@ -374,19 +446,19 @@ exports.deletePatientDetails = async (req, res) => {
       }
     }
 
-    // ✅ 5. SOFT DELETE
+    // ✅ 5. USER DELETE (SOFT DELETE)
     patient.isDeleted = true;
     await patient.save();
 
-    return res.status(200).json({
+    res.status(200).json({
       success: true,
       message: "Patient deleted successfully"
     });
 
   } catch (err) {
-    console.error("DELETE PATIENT ERROR:", err);
+    console.error("DELETE ERROR:", err);
 
-    return res.status(500).json({
+    res.status(500).json({
       success: false,
       message: "Delete failed",
       error: err.message

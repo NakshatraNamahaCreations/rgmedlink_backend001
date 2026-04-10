@@ -7,13 +7,17 @@ const {
   getPatientDetailsById,
   updatePatientDetails,
   getAllPatientDetails,
-  deletePatientDetails
+  deletePatientDetails,
+  getPatientStats
 } = require("../controllers/patientDetailsController");
 
 router.post("/create", createPatientDetails);
 
-// ✅ MOVE THIS UP
+// ✅ Correct order
 router.get("/all", getAllPatientDetails);
+
+// ✅ FIX HERE
+router.get("/stats", getPatientStats);
 
 // Existing routes
 router.get("/", getPatientDetails);
