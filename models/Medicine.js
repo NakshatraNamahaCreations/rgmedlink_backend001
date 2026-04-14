@@ -30,11 +30,6 @@ const medicineSchema = new mongoose.Schema(
     default: 0
   },
 
-  /* legacy alias — kept for backward compat */
-  price: {
-    type: Number,
-    default: 0
-  },
 
   /* INVENTORY */
   stock: {

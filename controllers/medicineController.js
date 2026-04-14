@@ -17,6 +17,9 @@ function paginate(query) {
 exports.createMedicine = async (req, res) => {
   try {
     const data = req.body;
+    if (!req.body.sellingPrice && req.body.price) {
+  req.body.sellingPrice = req.body.price;
+}
 
     if (data.status === "Inactive" && !data.inactiveReason) {
       return res.status(400).json({ message: "Reason required for inactive medicine" });
@@ -101,6 +104,10 @@ exports.getMedicineById = async (req, res) => {
 ================================ */
 exports.updateMedicine = async (req, res) => {
   try {
+    // Ensure sellingPrice always exists
+if (!req.body.sellingPrice && req.body.price) {
+  req.body.sellingPrice = req.body.price;
+}
     const medicine = await Medicine.findByIdAndUpdate(req.params.id, req.body, { new: true,  runValidators: true });
     res.json(medicine);
   } catch (error) {
