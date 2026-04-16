@@ -126,24 +126,24 @@ exports.createOrder = async (req, res) => {
   try {
     const { patientId, addressId, prescriptionId, items } = req.body;
 
-    // ✅ VALIDATE PATIENT ID FIRST
-    if (!patientId) {
-      return res.status(400).json({
-        success: false,
-        message: "Patient is required",
-      });
-    }
+    // ✅ VALIDATE PATIENT ID
+if (!patientId) {
+  return res.status(400).json({
+    success: false,
+    message: "patientId is required",
+  });
+}
 
-    const patient = await PatientDetails.findById(patientId);
+const patient = await PatientDetails.findById(patientId);
 
-    if (!patient) {
-      return res.status(404).json({
-        success: false,
-        message: "Patient not found",
-      });
-    }
+if (!patient) {
+  return res.status(404).json({
+    success: false,
+    message: "Patient not found",
+  });
+}
 
-    // ✅ VALIDATE ITEMS (VERY IMPORTANT)
+    // ✅ VALIDATE ITEMS
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({
         success: false,
@@ -197,13 +197,13 @@ exports.createOrder = async (req, res) => {
     // 🔥 CALCULATE TOTAL
     const subtotal = items.reduce((sum, item) => {
       const med = medMap[item.medicineId.toString()];
-      const price = med.sellingPrice || med.price || 0;
+      const price = Number(med.sellingPrice || 0);
       return sum + item.qty * price;
     }, 0);
 
     const gst = items.reduce((sum, item) => {
       const med = medMap[item.medicineId.toString()];
-      const price = med.sellingPrice || med.price || 0;
+      const price = Number(med.sellingPrice || 0);
       const pct = med.gstPct || 12;
       return sum + (item.qty * price * pct) / 100;
     }, 0);
@@ -211,27 +211,42 @@ exports.createOrder = async (req, res) => {
     const serverTotal = Math.round((subtotal + gst) * 100) / 100;
 
     // ✅ GET ADDRESS
-    let address = addressId
-      ? await Address.findById(addressId)
-      : await Address.findOne({ userId, isDefault: true });
+ let address = null;
 
-    if (!address) {
-      return res.status(400).json({
-        success: false,
-        message: "Address not found",
-      });
-    }
+// ✅ 1. If addressId provided
+if (addressId) {
+  address = await Address.findById(addressId);
+}
+
+// ✅ 2. If not → try patient address
+if (!address && patient.addressId) {
+  address = await Address.findById(patient.addressId);
+}
+
+// ✅ 3. If not → fallback default
+if (!address) {
+  address = await Address.findOne({ userId, isDefault: true });
+}
+
+// ❌ Final validation
+if (!address) {
+  return res.status(400).json({
+    success: false,
+    message: "No address found for this patient"
+  });
+}
 
     // ✅ CREATE ORDER
     const order = await Order.create({
       userId,
       prescription: prescriptionId,
       patient: patient._id,
+      orderSource: "mobile",
       totalAmount: serverTotal,
 
       items: items.map((item) => {
         const med = medMap[item.medicineId.toString()];
-        const price = med.sellingPrice || med.price || 0;
+        const price = Number(med.sellingPrice || 0);
 
         return {
           medicineId: item.medicineId,
@@ -245,14 +260,14 @@ exports.createOrder = async (req, res) => {
         };
       }),
 
-     patientDetails: {
-  patientId: patient.patientId, // 🔥 ADD THIS
-  name: patient.name,
-  phone: patient.primaryPhone,
-  secondaryPhone: patient.secondaryPhone || "",
-  gender: patient.gender,
-  orderingFor: patient.orderingFor || "myself",
-},
+      patientDetails: {
+        patientId: patient.patientId,
+        name: patient.name,
+        phone: patient.primaryPhone,
+        secondaryPhone: patient.secondaryPhone || "",
+        gender: patient.gender,
+        orderingFor: patient.orderingFor || "myself",
+      },
 
       addressDetails: {
         fullAddress: address.fullAddress,
@@ -264,6 +279,23 @@ exports.createOrder = async (req, res) => {
       deliveryAddress: address.fullAddress,
     });
 
+    // ✅ 🔥 DEDUCT STOCK (FIXED POSITION + SYNTAX)
+    await Medicine.bulkWrite(
+      items.map((item) => ({
+        updateOne: {
+          filter: { _id: item.medicineId },
+          update: {
+            $inc: {
+              stock: -item.qty,
+              demand30: item.qty,
+              demand90: item.qty,
+            },
+          },
+        },
+      }))
+    );
+
+    // ✅ RESPONSE
     return res.status(201).json({
       success: true,
       message: "Order created successfully",
@@ -278,7 +310,6 @@ exports.createOrder = async (req, res) => {
     });
   }
 };
-
 // ============================
 // BILLING TABLE  (server-side paginated)
 // ============================
@@ -436,10 +467,24 @@ exports.generateInvoice = async (req, res) => {
 // ============================
 exports.deleteOrder = async (req, res) => {
   try {
-    const order = await Order.findByIdAndDelete(req.params.id);
-    if (!order) return res.status(404).json({ success: false, message: "Order not found" });
+    const order = await Order.findById(req.params.id);
 
-    res.json({ success: true, message: "Order deleted successfully" });
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found"
+      });
+    }
+
+    // ✅ SOFT DELETE
+    order.isDeleted = true;
+    await order.save();
+
+    res.json({
+      success: true,
+      message: "Order deleted successfully"
+    });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -496,16 +541,23 @@ exports.createAdminOrder = async (req, res) => {
   try {
     const { patientId, doctor, items, address, discount = 0, notes } = req.body;
 
-      const patient = await PatientDetails.findById(patientId);
+     
 
-    if (!patient) {
-      return res.status(404).json({
-        success: false,
-        message: "Patient not found",
-      });
-    }
+if (!patientId) {
+  return res.status(400).json({
+    success: false,
+    message: "patientId is required",
+  });
+}
 
-    if (!patientId) return res.status(400).json({ success: false, message: "patientId is required" });
+const patient = await PatientDetails.findById(patientId);
+
+if (!patient) {
+  return res.status(404).json({
+    success: false,
+    message: "Patient not found",
+  });
+}
     if (!items || !Array.isArray(items) || items.length === 0)
       return res.status(400).json({ success: false, message: "items array is required" });
     if (!address || !address.fullAddress)
@@ -524,36 +576,36 @@ exports.createAdminOrder = async (req, res) => {
     medicines.forEach((m) => { medMap[m._id.toString()] = m; });
 
   
-// 🔥 ADD THIS HERE 👇 (REPLACE OLD LOOP)
+      // 🔥 ADD THIS HERE 👇 (REPLACE OLD LOOP)
 
-// Merge quantities of same medicine
-const mergedItems = {};
+      // Merge quantities of same medicine
+      const mergedItems = {};
 
-items.forEach(item => {
-  const id = item.medicineId.toString();
-  if (!mergedItems[id]) mergedItems[id] = 0;
-  mergedItems[id] += item.qty;
-});
+      items.forEach(item => {
+        const id = item.medicineId.toString();
+        if (!mergedItems[id]) mergedItems[id] = 0;
+        mergedItems[id] += item.qty;
+      });
 
-// Validate stock
-for (const id in mergedItems) {
-  const med = medMap[id];
+      // Validate stock
+      for (const id in mergedItems) {
+        const med = medMap[id];
 
-  if (!med) {
-    return res.status(404).json({
-      success: false,
-      message: "Medicine not found",
-    });
-  }
+        if (!med) {
+          return res.status(404).json({
+            success: false,
+            message: "Medicine not found",
+          });
+        }
 
-  if (med.stock < mergedItems[id]) {
-    return res.status(400).json({
-      success: false,
-      message: `${med.name} only has ${med.stock} in stock`,
-    });
-  }
-}
-  
+        if (med.stock < mergedItems[id]) {
+          return res.status(400).json({
+            success: false,
+            message: `${med.name} only has ${med.stock} in stock`,
+          });
+        }
+      }
+        
 
     // Build prescription meds & totals
     let subtotal = 0;
@@ -562,7 +614,7 @@ for (const id in mergedItems) {
       const freq = item.freq || { m: 1, a: 0, n: 1 };
       const duration = item.duration || 5;
       const qty = item.qty ?? (freq.m + freq.a + freq.n) * duration;
-      const price = med.price || 0;
+      const price = Number(med.sellingPrice || 0);
       const itemSub = qty * price;
       subtotal += itemSub;
       return { medicine: med._id, duration, freq, qty, price, subtotal: itemSub };
@@ -593,21 +645,13 @@ for (const id in mergedItems) {
       ...(notes ? { notes } : {}),
     });
 
-    // ── Bulk stock deduction (not N+1 loop) ──
-  await Medicine.bulkWrite(
-  Object.entries(mergedItems).map(([id, qty]) => ({
-    updateOne: {
-      filter: { _id: id },
-      update: { $inc: { stock: -qty, demand30: qty, demand90: qty } },
-    },
-  }))
-);
+
 
     const order = await Order.create({
       userId: patient.userId,
       prescription: prescription._id,
       patient: patient._id,
-
+orderSource: "admin",
       totalAmount: total,
       patientDetails: {
         name: patient.name,
@@ -626,6 +670,22 @@ for (const id in mergedItems) {
       paymentStatus: "Paid",
       orderStatus: "Processing",
     });
+
+// 🔥 DEDUCT STOCK (ADD THIS)
+await Medicine.bulkWrite(
+  Object.entries(mergedItems).map(([id, qty]) => ({
+    updateOne: {
+      filter: { _id: id },
+      update: {
+        $inc: {
+          stock: -qty,
+          demand30: qty,
+          demand90: qty,
+        },
+      },
+    },
+  }))
+);
 
     const populated = await Order.findById(order._id).populate({
       path: "prescription",

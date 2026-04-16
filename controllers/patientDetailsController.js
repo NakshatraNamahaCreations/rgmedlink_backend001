@@ -74,29 +74,28 @@ exports.createPatientDetails = async (req, res) => {
     // =========================================
     // 🔥 CREATE ADDRESS (IF PROVIDED)
     // =========================================
+let addressDoc = null;
 
-   let addressDoc = null;
-
-// ✅ SAFE HYBRID FIX (IMPORTANT)
-// if (!req.body.addressId && fullAddress) {
-//   addressDoc = await Address.create({
-//     userId,
-//     fullAddress,
-//     city,
-//     state,
-//     pincode,
-//     isDefault: true
-//   });
-// }
+// ✅ CREATE ADDRESS IF ADMIN SENDS IT
+if (!req.body.addressId && fullAddress) {
+  addressDoc = await Address.create({
+    userId,
+    fullAddress,
+    city,
+    state,
+    pincode,
+    isDefault: true
+  });
+}
 
     // =========================================
     // 🔥 CREATE PATIENT WITH ADDRESS LINK
     // =========================================
 
-    const patientData = {
-      ...req.body,
-      addressId: addressDoc ? addressDoc._id : undefined
-    };
+const patientData = {
+  ...req.body,
+  addressId: req.body.addressId || (addressDoc ? addressDoc._id : undefined)
+};
 
     const data = await PatientDetails.create(patientData);
 
@@ -274,38 +273,124 @@ const Order = require("../models/Order");
 
 exports.getAllPatientDetails = async (req, res) => {
   try {
-
 const data = await PatientDetails.aggregate([
-  {
-    $match: {
-      isDeleted: false
-    }
-  },
+  { $match: { isDeleted: false } },
+
+  // =========================
+  // ✅ GET ORDERS
+  // =========================
   {
     $lookup: {
       from: "orders",
       localField: "_id",
       foreignField: "patient",
-      as: "orders",
-    },
+      as: "orders"
+    }
+  },
+
+  // =========================
+  // ✅ UNWIND ORDERS
+  // =========================
+  {
+    $unwind: {
+      path: "$orders",
+      preserveNullAndEmptyArrays: true
+    }
+  },
+
+  // =========================
+  // ✅ POPULATE PRESCRIPTION
+  // =========================
+  {
+    $lookup: {
+      from: "prescriptions",
+      localField: "orders.prescription",
+      foreignField: "_id",
+      as: "prescriptionData"
+    }
   },
   {
-  $lookup: {
-    from: "addresses",
-    localField: "addressId",
-    foreignField: "_id",
-    as: "address"
-  }
-},
-{
-  $unwind: {
-    path: "$address",
-    preserveNullAndEmptyArrays: true
-  }
-},
-  {
-    $sort: { createdAt: -1 },
+    $unwind: {
+      path: "$prescriptionData",
+      preserveNullAndEmptyArrays: true
+    }
   },
+
+  // =========================
+  // ✅ MERGE PRESCRIPTION INTO ORDER
+  // =========================
+  {
+    $addFields: {
+      "orders.prescription": "$prescriptionData"
+    }
+  },
+  {
+    $project: {
+      prescriptionData: 0
+    }
+  },
+
+  // =========================
+  // ✅ GROUP BACK ORDERS
+  // =========================
+  {
+    $group: {
+      _id: "$_id",
+      doc: { $first: "$$ROOT" },
+      orders: { $push: "$orders" }
+    }
+  },
+
+  // =========================
+  // ✅ RESTORE ROOT STRUCTURE
+  // =========================
+  {
+    $replaceRoot: {
+      newRoot: {
+        $mergeObjects: ["$doc", { orders: "$orders" }]
+      }
+    }
+  },
+
+  // =========================
+  // ✅ REMOVE NULL ORDERS (IMPORTANT)
+  // =========================
+  {
+    $addFields: {
+      orders: {
+        $filter: {
+          input: "$orders",
+          as: "o",
+          cond: { $ne: ["$$o", null] }
+        }
+      }
+    }
+  },
+
+  // =========================
+  // ✅ POPULATE ADDRESS
+  // =========================
+  {
+    $lookup: {
+      from: "addresses",
+      localField: "addressId",
+      foreignField: "_id",
+      as: "address"
+    }
+  },
+  {
+    $unwind: {
+      path: "$address",
+      preserveNullAndEmptyArrays: true
+    }
+  },
+
+  // =========================
+  // ✅ SORT
+  // =========================
+  {
+    $sort: { createdAt: -1 }
+  }
 ]);
 
     res.json({
@@ -415,15 +500,31 @@ exports.deletePatientDetails = async (req, res) => {
     }
 
     // ✅ 2. CHECK USER OWNERSHIP
-    if (patient.userId !== req.user?.phone) {
-      return res.status(403).json({
-        success: false,
-        message: "Not authorized"
-      });
-    }
+    // if (patient.userId !== req.user?.phone) {
+    //   return res.status(403).json({
+    //     success: false,
+    //     message: "Not authorized"
+    //   });
+    // }
+// ✅ Allow Postman bypass ONLY in development
+const isPostman =
+  req.headers["x-debug-mode"] === "true" &&
+  process.env.NODE_ENV !== "production";
+
+if (!isPostman) {
+  if (patient.userId !== req.user?.phone) {
+    return res.status(403).json({
+      success: false,
+      message: "Not authorized"
+    });
+  }
+}
 
     // ✅ 3. CHECK ORDERS
-    const orderExists = await Order.exists({ patient: patient._id });
+   const orderExists = await Order.exists({
+  patient: patient._id,
+  isDeleted: false   // ✅ add this line
+});
 
     if (orderExists) {
       return res.status(400).json({

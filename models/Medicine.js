@@ -13,12 +13,18 @@ const medicineSchema = new mongoose.Schema(
     default: "Tablet"
   },
 
-  unit: {
-    type: String,
-    enum: ["Tablet","Bottle","Strip","Tube","Box"],
-    default: "Tablet"
-  },
+unit: {
+  type: String,
+  required: true
+},
 
+normalizedName: {
+  type: String,
+  lowercase: true,
+  trim: true,
+  index: true,
+  unique: true   // ✅ ADD THIS
+},
   /* PRICING */
   costPrice: {
     type: Number,
@@ -128,6 +134,14 @@ medicineSchema.virtual("daysUntilStockout").get(function(){
 
 });
 
+medicineSchema.pre("save", function () {
+  if (this.name) {
+    this.normalizedName = this.name
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+});
 
 /* ===============================
    PROFIT MARGIN

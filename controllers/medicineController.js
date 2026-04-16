@@ -1,4 +1,6 @@
 const Medicine = require("../models/Medicine");
+const XLSX = require("xlsx");
+
 
 /* ── pagination helper ───────────────────────────────────────── */
 function paginate(query) {
@@ -11,26 +13,209 @@ function paginate(query) {
 }
 
 
+
+/* ===============================
+   BULK UPLOAD MEDICINES (EXCEL)
+================================ */
+exports.uploadMedicinesExcel = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: "Excel file required" });
+    }
+
+    const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    const data = XLSX.utils.sheet_to_json(sheet);
+
+    // ✅ CLEAN FUNCTION (remove spaces, tabs, multiple spaces)
+    const clean = (val) =>
+      typeof val === "string"
+        ? val.replace(/\s+/g, " ").trim()
+        : val;
+
+    // ✅ CLEAN WHOLE ROW (VERY IMPORTANT)
+    const cleanRow = (row) => {
+      const cleaned = {};
+      for (let key in row) {
+        cleaned[key] = clean(row[key]);
+      }
+      return cleaned;
+    };
+
+    let parsedData = [];
+
+    for (let row of data) {
+      // ✅ CLEAN ENTIRE ROW
+      const r = cleanRow(row);
+
+      const name = r.name || r.MedicineName;
+      if (!name) continue;
+
+      const normalize = (str) =>
+        str.toLowerCase().replace(/\s+/g, " ").trim();
+
+      const normalizedName = normalize(name);
+
+const existing = await Medicine.findOne({
+  normalizedName
+});
+
+      
+    // ✅ CATEGORY-BASED UNIT VALIDATION
+      const categoryUnitMap = {
+        Liquid: ["ML"],
+        Powder: ["Grams"],
+        Tablet: ["Tablet", "Strip"],
+        Capsule: ["Capsule"],
+        Syrup: ["ML"],
+        Injection: ["ML"],
+        Ointment: ["Grams"],
+        Device: ["Unit"]
+      };
+
+      const category = r.category || "Tablet";
+      const allowedUnits = categoryUnitMap[category] || ["Tablet"];
+
+      const unit = allowedUnits.includes(r.unit)
+        ? r.unit
+        : allowedUnits[0];
+
+      const payload = {
+        name,
+        category: r.category || "Tablet",
+        unit,
+        costPrice: Number(r.costPrice) || 0,
+        sellingPrice: Number(r.sellingPrice) || 0,
+        stock: Number(r.stock) || 0,
+        minStock: Number(r.minStock) || 10,
+        status: r.status || "Active",
+      };
+
+      parsedData.push({
+        ...payload,
+        exists: !!existing,
+        id: existing?._id || null
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: parsedData
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      message: "Excel parsing failed",
+      error: error.message,
+    });
+  }
+};
+
+
+exports.bulkSaveMedicines = async (req, res) => {
+  try {
+    const medicines = req.body.medicines;
+
+    let created = 0;
+    let updated = 0;
+
+for (let item of medicines) {
+  const { id, exists, ...cleanData } = item;
+
+  if (id) {
+   const updatedData = {
+  ...cleanData,
+  normalizedName: cleanData.name
+    ?.toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim()
+};
+
+await Medicine.findByIdAndUpdate(id, updatedData);
+    updated++;
+  } else {
+   const normalizedName = cleanData.name
+  ?.toLowerCase()
+  .replace(/\s+/g, " ")
+  .trim();
+
+await Medicine.findOneAndUpdate(
+  { normalizedName },
+  {
+    ...cleanData,
+    normalizedName
+  },
+  { upsert: true, new: true }
+);
+    created++;
+  }
+}
+
+    res.json({
+      success: true,
+      created,
+      updated
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      message: "Bulk save failed",
+      error: error.message
+    });
+  }
+};
+
 /* ===============================
    CREATE MEDICINE
 ================================ */
+
 exports.createMedicine = async (req, res) => {
   try {
     const data = req.body;
-    if (!req.body.sellingPrice && req.body.price) {
-  req.body.sellingPrice = req.body.price;
-}
 
+    // Fix sellingPrice fallback
+    if (!data.sellingPrice && data.price) {
+      data.sellingPrice = data.price;
+    }
+
+    // Inactive validation
     if (data.status === "Inactive" && !data.inactiveReason) {
-      return res.status(400).json({ message: "Reason required for inactive medicine" });
+      return res.status(400).json({
+        message: "Reason required for inactive medicine"
+      });
+    }
+
+    // ✅ CATEGORY-UNIT VALIDATION
+    const categoryUnitMap = {
+      Liquid: ["ML"],
+      Powder: ["Grams"],
+      Tablet: ["Tablet", "Strip"],
+      Capsule: ["Capsule"],
+      Syrup: ["ML"],
+      Injection: ["ML"],
+      Ointment: ["Grams"],
+      Device: ["Unit"]
+    };
+
+    const { category, unit } = data;
+
+    if (categoryUnitMap[category]) {
+      if (!categoryUnitMap[category].includes(unit)) {
+        return res.status(400).json({
+          message: `Invalid unit '${unit}' for category '${category}'`
+        });
+      }
     }
 
     const medicine = await Medicine.create(data);
+
     res.status(201).json(medicine);
+
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 };
+
 
 
 /* ===============================
@@ -104,12 +289,49 @@ exports.getMedicineById = async (req, res) => {
 ================================ */
 exports.updateMedicine = async (req, res) => {
   try {
-    // Ensure sellingPrice always exists
-if (!req.body.sellingPrice && req.body.price) {
-  req.body.sellingPrice = req.body.price;
-}
-    const medicine = await Medicine.findByIdAndUpdate(req.params.id, req.body, { new: true,  runValidators: true });
+
+    if (!req.body.sellingPrice && req.body.price) {
+      req.body.sellingPrice = req.body.price;
+    }
+
+    // ✅ ADD SAME VALIDATION
+    const categoryUnitMap = {
+      Liquid: ["ML"],
+      Powder: ["Grams"],
+      Tablet: ["Tablet", "Strip"],
+      Capsule: ["Capsule"],
+      Syrup: ["ML"],
+      Injection: ["ML"],
+      Ointment: ["Grams"],
+      Device: ["Unit"]
+    };
+
+    const { category, unit } = req.body;
+
+    if (categoryUnitMap[category]) {
+      if (!categoryUnitMap[category].includes(unit)) {
+        return res.status(400).json({
+          message: `Invalid unit '${unit}' for category '${category}'`
+        });
+      }
+    }
+
+const updatedData = {
+  ...req.body,
+  normalizedName: req.body.name
+    ?.toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim()
+};
+
+const medicine = await Medicine.findByIdAndUpdate(
+  req.params.id,
+  updatedData,
+  { new: true, runValidators: true }
+);
+
     res.json(medicine);
+
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

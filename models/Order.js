@@ -137,7 +137,15 @@ const orderSchema = new mongoose.Schema(
       default: "Created",
       index: true,
     },
-
+    orderSource: {
+    type: String,
+    enum: ["admin", "mobile"],
+    default: "mobile"
+    },
+    isDeleted: {
+      type: Boolean,
+      default: false
+    },
     deliveryAddress: {
       type: String,
       default: "",
