@@ -9,10 +9,10 @@ const Prescription = require("../models/Prescription");
 const Razorpay = require("razorpay");
 const crypto = require("crypto");
 
-// const razorpay = new Razorpay({
-//   key_id: process.env.RAZORPAY_KEY_ID,
-//   key_secret: process.env.RAZORPAY_KEY_SECRET,
-// });
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
 
 
 exports.createRazorpayOrder = async (req, res) => {
@@ -28,7 +28,6 @@ exports.createRazorpayOrder = async (req, res) => {
       });
     }
 
-    // ✅ Prevent duplicate payment
     if (order.paymentStatus === "Paid") {
       return res.json({
         success: true,
@@ -37,10 +36,14 @@ exports.createRazorpayOrder = async (req, res) => {
     }
 
     const razorpayOrder = await razorpay.orders.create({
-      amount: Math.round(order.totalAmount * 100), // ₹ → paise
+      amount: Math.round(order.totalAmount * 100),
       currency: "INR",
       receipt: order.orderId,
     });
+
+    // ✅ SAVE THIS (IMPORTANT)
+    order.razorpayOrderId = razorpayOrder.id;
+    await order.save();
 
     res.json({
       success: true,
@@ -57,6 +60,7 @@ exports.createRazorpayOrder = async (req, res) => {
   }
 };
 
+
 exports.verifyRazorpayPayment = async (req, res) => {
   try {
     const {
@@ -66,6 +70,7 @@ exports.verifyRazorpayPayment = async (req, res) => {
       orderId,
     } = req.body;
 
+    // 🔒 Step 1: Verify signature
     const body = razorpay_order_id + "|" + razorpay_payment_id;
 
     const expectedSignature = crypto
@@ -80,6 +85,7 @@ exports.verifyRazorpayPayment = async (req, res) => {
       });
     }
 
+    // 🔍 Step 2: Find order
     const order = await Order.findById(orderId);
 
     if (!order) {
@@ -89,9 +95,29 @@ exports.verifyRazorpayPayment = async (req, res) => {
       });
     }
 
-    // ✅ UPDATE YOUR EXISTING FIELDS
+    // 🚫 Step 3: Prevent duplicate payment
+    if (order.paymentStatus === "Paid") {
+      return res.json({
+        success: true,
+        message: "Already paid",
+        order,
+      });
+    }
+
+    // 🔒 Step 4: Validate Razorpay order ID (VERY IMPORTANT)
+    if (order.razorpayOrderId !== razorpay_order_id) {
+      return res.status(400).json({
+        success: false,
+        message: "Order mismatch",
+      });
+    }
+
+    // ✅ Step 5: Save payment details
     order.paymentStatus = "Paid";
     order.paymentDate = new Date();
+
+    order.razorpayPaymentId = razorpay_payment_id;
+    order.razorpaySignature = razorpay_signature;
 
     await order.save();
 
@@ -318,12 +344,16 @@ exports.getBillingTable = async (req, res) => {
     const { page, limit, skip, all } = paginate(req.query);
     const { search, invoiceStatus, paymentStatus, from, to } = req.query;
 
-    const filter = {};
-    if (invoiceStatus) filter.invoiceStatus = invoiceStatus;
-    if (paymentStatus) filter.paymentStatus = paymentStatus;
+    // ✅ FIXED: always use queryFilter
+    const queryFilter = {
+      isDeleted: { $ne: true } // 🔥 important
+    };
+
+    if (invoiceStatus) queryFilter.invoiceStatus = invoiceStatus;
+    if (paymentStatus) queryFilter.paymentStatus = paymentStatus;
 
     if (search) {
-      filter.$or = [
+      queryFilter.$or = [
         { orderId: { $regex: search, $options: "i" } },
         { invoiceNumber: { $regex: search, $options: "i" } },
         { "patientDetails.name": { $regex: search, $options: "i" } },
@@ -331,24 +361,34 @@ exports.getBillingTable = async (req, res) => {
     }
 
     if (from || to) {
-      filter.createdAt = {};
-      if (from) filter.createdAt.$gte = new Date(from);
-      if (to) filter.createdAt.$lte = new Date(new Date(to).setHours(23, 59, 59, 999));
+      queryFilter.createdAt = {};
+      if (from) queryFilter.createdAt.$gte = new Date(from);
+      if (to) {
+        queryFilter.createdAt.$lte = new Date(
+          new Date(to).setHours(23, 59, 59, 999)
+        );
+      }
     }
 
-    let q = Order.find(filter)
-  .select("orderId invoiceNumber invoiceStatus invoiceDate paymentStatus totalAmount patientDetails createdAt items")
-  .sort({ createdAt: -1 })
-  .lean();
+    let q = Order.find(queryFilter)
+      .select(
+        "orderId invoiceNumber invoiceStatus invoiceDate paymentStatus totalAmount patientDetails createdAt items"
+      )
+      .sort({ createdAt: -1 })
+      .lean();
 
     if (!all) q = q.skip(skip).limit(limit);
 
-    const [orders, total] = await Promise.all([q, Order.countDocuments(filter)]);
+    const [orders, total] = await Promise.all([
+      q,
+      Order.countDocuments(queryFilter)
+    ]);
 
     const table = orders.map((o) => ({
       id: o._id,
       orderId: o.orderId || "-",
-      invoiceNumber: o.invoiceStatus === "Generated" ? o.invoiceNumber : "-",
+      invoiceNumber:
+        o.invoiceStatus === "Generated" ? o.invoiceNumber : "-",
       invoiceDate: o.invoiceDate || "-",
       customerName: o.patientDetails?.name || "Unknown",
       billAmount: o.totalAmount || 0,
@@ -378,36 +418,63 @@ exports.getBillingTable = async (req, res) => {
 exports.getOrders = async (req, res) => {
   try {
     const { page, limit, skip, all } = paginate(req.query);
-    const { search, orderStatus, paymentStatus, from, to } = req.query;
+    const { search, orderStatus, paymentStatus, from, to, filter } = req.query;
 
-    const filter = {};
-    if (orderStatus) filter.orderStatus = orderStatus;
-    if (paymentStatus) filter.paymentStatus = paymentStatus;
+    const queryFilter = {
+      isDeleted: { $ne: true } // ✅ prevent deleted data
+    };
+
+    if (orderStatus) queryFilter.orderStatus = orderStatus;
+    if (paymentStatus) queryFilter.paymentStatus = paymentStatus;
 
     if (search) {
-      filter.$or = [
+      queryFilter.$or = [
         { orderId: { $regex: search, $options: "i" } },
         { "patientDetails.name": { $regex: search, $options: "i" } },
       ];
     }
 
     if (from || to) {
-      filter.createdAt = {};
-      if (from) filter.createdAt.$gte = new Date(from);
-      if (to) filter.createdAt.$lte = new Date(new Date(to).setHours(23, 59, 59, 999));
+      queryFilter.createdAt = {};
+      if (from) queryFilter.createdAt.$gte = new Date(from);
+      if (to) queryFilter.createdAt.$lte = new Date(
+        new Date(to).setHours(23, 59, 59, 999)
+      );
     }
 
-    let q = Order.find(filter)
-      .populate({ path: "prescription", populate: { path: "meds.medicine" } })
+    const now = new Date();
+    const next7 = new Date();
+    next7.setDate(now.getDate() + 7);
+
+    // 🔥 STEP 1: Fetch ALL matching orders (no skip/limit yet)
+    const allOrders = await Order.find(queryFilter)
+      .populate({
+        path: "prescription",
+        match:
+          filter === "active"
+            ? { expiry: { $gt: next7 } }
+            : filter === "expiring"
+            ? { expiry: { $gt: now, $lte: next7 } }
+            : filter === "expired"
+            ? { expiry: { $lte: now } }
+            : {},
+      })
       .sort({ createdAt: -1 });
 
-    if (!all) q = q.skip(skip).limit(limit);
+    // 🔥 STEP 2: Remove unmatched (important)
+    const filteredOrders = allOrders.filter(o => o.prescription !== null);
 
-    const [orders, total] = await Promise.all([q, Order.countDocuments(filter)]);
+    // 🔥 STEP 3: TOTAL (correct)
+    const total = filteredOrders.length;
+
+    // 🔥 STEP 4: Apply pagination AFTER filtering
+    const paginatedOrders = all
+      ? filteredOrders
+      : filteredOrders.slice(skip, skip + limit);
 
     res.json({
       success: true,
-      data: orders,
+      data: paginatedOrders,
       pagination: {
         page: all ? 1 : page,
         limit: all ? total : limit,
@@ -415,6 +482,7 @@ exports.getOrders = async (req, res) => {
         totalPages: all ? 1 : Math.ceil(total / limit) || 1,
       },
     });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -717,5 +785,64 @@ exports.updateOrderStatus = async (req, res) => {
     res.json({ success: true, order });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+};
+
+
+exports.updatePaymentStatus = async (req, res) => {
+  try {
+    const { status } = req.body;
+
+    const validStatuses = ["Pending", "Paid", "Failed", "Refunded"];
+
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid payment status",
+      });
+    }
+
+    const order = await Order.findById(req.params.id);
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    // 🚫 Prevent Paid → Pending (important)
+    if (order.paymentStatus === "Paid" && status === "Pending") {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot revert Paid to Pending. Use refund instead.",
+      });
+    }
+
+    // ✅ Update status
+    order.paymentStatus = status;
+
+    if (status === "Paid") {
+      order.paymentDate = new Date();
+    }
+
+    if (status === "Refunded") {
+      order.paymentDate = null;
+    }
+
+    await order.save();
+
+    res.json({
+      success: true,
+      message: "Payment status updated",
+      data: order,
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: "Update failed",
+      error: err.message,
+    });
   }
 };

@@ -13,6 +13,7 @@ const {
   markPaymentPaid,
    createRazorpayOrder,
   verifyRazorpayPayment,
+  updatePaymentStatus
 } = require("../controllers/orderController");
 
 // ADMIN: CREATE ORDER DIRECTLY (patient + medicines + address in one shot)
@@ -22,7 +23,7 @@ router.post("/admin-create", createAdminOrder);
 router.post("/create-razorpay-order", createRazorpayOrder);
 router.post("/verify-payment", verifyRazorpayPayment);
 
-
+router.patch("/update-payment/:id", updatePaymentStatus);
 // CREATE ORDER (customer flow — requires existing prescription)
 router.post("/create", createOrder);
 

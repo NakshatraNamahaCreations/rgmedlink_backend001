@@ -25,41 +25,37 @@ exports.getDashboardSummary = async (req, res) => {
     const { start: todayStart, end: todayEnd } = dayRange(today);
     const thisMonthStart = new Date(today.getFullYear(), today.getMonth(), 1);
     const lastMonthStart = new Date(today.getFullYear(), today.getMonth() - 1, 1);
-    const lastMonthEnd   = new Date(today.getFullYear(), today.getMonth(), 0, 23, 59, 59, 999);
+    const lastMonthEnd = new Date(today.getFullYear(), today.getMonth(), 0, 23, 59, 59, 999);
+
+    const now = new Date();
+    const next7 = new Date();
+    next7.setDate(now.getDate() + 7);
 
     /* ── Run ALL aggregations in parallel ── */
     const [
       patientCounts,
-      rxAgg,
       orderAgg,
       revenueAggs,
       inventoryAgg,
       expiryItems,
       topMedsAgg,
+      // 🔥 NEW: prescription counts
+      totalPrescriptions,
+      activePrescriptions,
+      expiringPrescriptions,
+      expiredPrescriptions
     ] = await Promise.all([
 
-      // ── PATIENTS: 3 counts in parallel via Promise.all ──
+      // ── PATIENTS ──
       Promise.all([
         Patient.countDocuments(),
         Patient.countDocuments({ createdAt: { $gte: thisMonthStart } }),
         Patient.countDocuments({ createdAt: { $gte: lastMonthStart, $lte: lastMonthEnd } }),
       ]),
 
-      // ── PRESCRIPTIONS: single aggregation for all counts ──
-      Prescription.aggregate([
-        {
-          $facet: {
-            byOrderStatus: [{ $group: { _id: "$orderStatus", count: { $sum: 1 } } }],
-            byPayStatus: [{ $group: { _id: "$payStatus", count: { $sum: 1 } } }],
-            today: [
-              { $match: { createdAt: { $gte: todayStart, $lte: todayEnd } } },
-              { $count: "count" },
-            ],
-          },
-        },
-      ]),
+      // ❌ REMOVED rxAgg (WRONG LOGIC)
 
-      // ── ORDERS: single aggregation with $facet ──
+      // ── ORDERS ──
       Order.aggregate([
         {
           $facet: {
@@ -73,7 +69,7 @@ exports.getDashboardSummary = async (req, res) => {
         },
       ]),
 
-      // ── REVENUE: single aggregation with $facet ──
+      // ── REVENUE ──
       Order.aggregate([
         { $match: { paymentStatus: "Paid" } },
         {
@@ -95,7 +91,7 @@ exports.getDashboardSummary = async (req, res) => {
         },
       ]),
 
-      // ── INVENTORY: aggregation for stock stats instead of loading all docs ──
+      // ── INVENTORY ──
       Medicine.aggregate([
         {
           $facet: {
@@ -114,47 +110,46 @@ exports.getDashboardSummary = async (req, res) => {
               { $match: { $expr: { $gt: ["$stock", "$minStock"] } } },
               { $count: "count" },
             ],
-            reorderCost: [
-              { $match: { $expr: { $lt: ["$stock", "$minStock"] } } },
-              { $group: { _id: null, cost: { $sum: { $multiply: [{ $subtract: ["$minStock", "$stock"] }, { $ifNull: ["$price", 0] }] } } } },
-            ],
-            inventoryValue: [
-              { $group: { _id: null, value: { $sum: { $multiply: ["$stock", { $ifNull: ["$price", 0] }] } } } },
-            ],
           },
         },
       ]),
 
-      // ── EXPIRY: only fetch medicines with expiry, limited fields ──
+      // ── EXPIRY ITEMS ──
       Medicine.find({ expiry: { $exists: true, $ne: null } })
         .select("name expiry stock")
         .sort({ expiry: 1 })
         .limit(20)
         .lean(),
 
-      // ── TOP MEDICINES by demand ──
+      // ── TOP MEDS ──
       Medicine.find({ demand30: { $gt: 0 } })
         .select("name demand30 demand90 stock price")
         .sort({ demand30: -1 })
         .limit(5)
         .lean(),
+
+      // 🔥 PRESCRIPTION COUNTS (CORRECT LOGIC)
+      Prescription.countDocuments({
+      expiry: { $exists: true }
+    }),
+
+      Prescription.countDocuments({
+        expiry: { $exists: true, $gt: next7 }
+      }),
+
+      Prescription.countDocuments({
+        expiry: { $gt: now, $lte: next7 }
+      }),
+
+      Prescription.countDocuments({
+        expiry: { $lte: now }
+      }),
     ]);
 
-    /* ── Parse patient counts ── */
+    /* ── Patients ── */
     const [totalPatients, newPatientsThisMonth, newPatientsLastMonth] = patientCounts;
-    const patientGrowthPct = newPatientsLastMonth === 0
-      ? (newPatientsThisMonth > 0 ? 100 : 0)
-      : Math.round(((newPatientsThisMonth - newPatientsLastMonth) / newPatientsLastMonth) * 100);
 
-    /* ── Parse prescription aggregation ── */
-    const rxData = rxAgg[0];
-    const rxByOrder = {};
-    rxData.byOrderStatus.forEach((s) => { rxByOrder[s._id] = s.count; });
-    const rxByPay = {};
-    rxData.byPayStatus.forEach((s) => { rxByPay[s._id] = s.count; });
-    const totalPrescriptions = Object.values(rxByOrder).reduce((a, b) => a + b, 0);
-
-    /* ── Parse order aggregation ── */
+    /* ── Orders ── */
     const ordData = orderAgg[0];
     const ordByStatus = {};
     ordData.byStatus.forEach((s) => { ordByStatus[s._id] = s.count; });
@@ -162,82 +157,29 @@ exports.getDashboardSummary = async (req, res) => {
     ordData.byPayment.forEach((s) => { ordByPay[s._id] = s.count; });
     const totalOrders = Object.values(ordByStatus).reduce((a, b) => a + b, 0);
 
-    /* ── Parse revenue ── */
+    /* ── Revenue ── */
     const revData = revenueAggs[0];
     const totalRevenue = revData.total[0]?.sum || 0;
-    const todayRevenue = revData.today[0]?.sum || 0;
-    const monthRevenue = revData.thisMonth[0]?.sum || 0;
-    const lastMonthRevenue = revData.lastMonth[0]?.sum || 0;
-    const revenueGrowthPct = lastMonthRevenue === 0
-      ? (monthRevenue > 0 ? 100 : 0)
-      : Math.round(((monthRevenue - lastMonthRevenue) / lastMonthRevenue) * 100);
 
-    /* ── Parse inventory aggregation ── */
+    /* ── Inventory ── */
     const inv = inventoryAgg[0];
     const totalSKUs = inv.total[0]?.count || 0;
-    const activeSKUs = inv.active[0]?.count || 0;
-    const outOfStock = inv.outOfStock[0]?.count || 0;
-    const criticalStock = inv.critical[0]?.count || 0;
-    const lowStockItems = inv.lowStock[0]?.count || 0;
-    const inStockItems = inv.inStock[0]?.count || 0;
-    const reorderCost = Math.round((inv.reorderCost[0]?.cost || 0) * 100) / 100;
-    const totalInventoryValue = Math.round((inv.inventoryValue[0]?.value || 0) * 100) / 100;
 
-    /* ── Expiry risk (computed from lean docs) ── */
-    const expiryRisk = expiryItems.map((m) => {
-      const diffDays = (new Date(m.expiry) - today) / (1000 * 60 * 60 * 24);
-      let risk = "LOW";
-      if (diffDays < 0) risk = "EXPIRED";
-      else if (diffDays < 30) risk = "HIGH";
-      else if (diffDays < 90) risk = "MEDIUM";
-      return { name: m.name, expiry: m.expiry, stock: m.stock, risk, remainingDays: Math.floor(diffDays) };
-    });
-    const expiredCount = expiryRisk.filter((m) => m.risk === "EXPIRED").length;
-    const highRiskCount = expiryRisk.filter((m) => m.risk === "HIGH").length;
-
-    /* ── Graph data: top 15 by demand (lean query) ── */
-    const graphData = await Medicine.find({ $or: [{ demand30: { $gt: 0 } }, { stock: { $gt: 0 } }] })
-      .select("name demand30 stock")
-      .sort({ demand30: -1 })
-      .limit(15)
-      .lean();
-
-    /* ── Fetch medicines only when needed by Inventory (paginated separately) ── */
-    // For backward compat, still include medicines array but with lean()
-    const medicines = await Medicine.find().sort({ createdAt: -1 }).lean();
-    // Manually add virtuals for lean docs
-    medicines.forEach((m) => {
-      m.stockStatus = m.stock === 0 ? "Out of Stock" : m.stock <= m.minStock ? "Low Stock" : "In Stock";
-      m.autoReorderQty = m.stock >= m.minStock ? 0 : m.minStock + 20 - m.stock;
-      const dailyUsage = (m.demand30 || 0) / 30;
-      m.daysUntilStockout = dailyUsage === 0 ? "∞" : Math.floor(m.stock / dailyUsage);
-      m.profitPerUnit = (m.sellingPrice || 0) - (m.costPrice || 0);
-      m.profitMargin = !m.sellingPrice ? 0 : Math.round(((m.sellingPrice - (m.costPrice || 0)) / m.sellingPrice) * 100);
-    });
-
-    /* ── RESPONSE ── */
+    /* ── FINAL RESPONSE ── */
     res.json({
-      medicines,
-      totalSKUs,
-      criticalStock,
-      lowStockItems,
-      outOfStock,
       patients: {
         total: totalPatients,
-        newThisMonth: newPatientsThisMonth,
-        newLastMonth: newPatientsLastMonth,
-        growthPct: patientGrowthPct,
       },
+
       prescriptions: {
         total: totalPrescriptions,
-        pending: rxByOrder["Pending"] || 0,
-        paid: rxByPay["Paid"] || 0,
-        unpaid: rxByPay["Unpaid"] || 0,
-        today: rxData.today[0]?.count || 0,
+        active: activePrescriptions,
+        expiring: expiringPrescriptions,
+        expired: expiredPrescriptions,
       },
+
       orders: {
         total: totalOrders,
-        today: ordData.today[0]?.count || 0,
         pending: ordByStatus["Created"] || 0,
         processing: ordByStatus["Processing"] || 0,
         packed: ordByStatus["Packed"] || 0,
@@ -245,29 +187,16 @@ exports.getDashboardSummary = async (req, res) => {
         delivered: ordByStatus["Delivered"] || 0,
         paid: ordByPay["Paid"] || 0,
       },
+
       revenue: {
         total: totalRevenue,
-        today: todayRevenue,
-        thisMonth: monthRevenue,
-        lastMonth: lastMonthRevenue,
-        growthPct: revenueGrowthPct,
       },
+
       inventory: {
         totalSKUs,
-        activeSKUs,
-        outOfStock,
-        criticalStock,
-        lowStockItems,
-        inStockItems,
-        reorderCost,
-        totalInventoryValue,
-        expiredCount,
-        highRiskCount,
       },
-      graphData: graphData.map((m) => ({ name: m.name, demand: m.demand30 || 0, stock: m.stock })),
-      topMedicines: topMedsAgg.map((m) => ({ name: m.name, demand30: m.demand30, demand90: m.demand90, stock: m.stock, price: m.price })),
-      expiryRisk: expiryRisk.slice(0, 10),
     });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
